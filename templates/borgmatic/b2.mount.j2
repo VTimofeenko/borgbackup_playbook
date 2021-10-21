@@ -1,0 +1,13 @@
+[Unit]
+Description={{ service_name }} backblaze bucket mount
+After=network.target
+
+[Mount]
+What={{ b2.bucket_name }}
+Where={{ b2.mount_point }}
+Type=fuse.s3fs
+# LoadCredential=password_file:{{ s3_key_file }}  # TODO: check systemd-devel
+Options=passwd_file={{ s3_key_file }},url={{ b2.bucket_url }}
+
+[Install]
+WantedBy=multi-user.target

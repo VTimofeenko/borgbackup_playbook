@@ -1,0 +1,12 @@
+[Unit]
+Description={{ nfs.description }}
+After=network.target
+
+[Mount]
+What={{ nfs.server }}:{{ nfs.what }}
+Where={{ nfs.where }}
+Type=nfs
+Options={{ nfs.options }}
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,137 @@
+---
+- name: "Configure borgmatic for {{ service_name }}"
+  hosts: "{{hostlist}}"
+  become: true
+  vars:
+    base_service_name: "borg_backup_{{ service_name }}"
+    backup_service_name: "{{ base_service_name }}.service"
+    backup_timer_name: "{{ base_service_name }}.timer"
+    backup_username: "borgbackup"
+    config_name: "/etc/borgmatic/{{ service_name }}_config.yaml"
+  pre_tasks:
+    - name: PREP | Retrieve or generate the passphrase
+      no_log: true
+      tags: config
+      block:
+      - name: PREP | Generate passphrase
+        become: false
+        delegate_to: localhost
+        shell: diceware -l 6 -c -d ""
+        changed_when: false
+        register: dice
+
+      - name: PREP | Generate backup passphrase
+        # note: better to use lookup plugin for password-store
+        import_tasks: "{{ inventory_dir }}/tasks/password-store/create-or-retrieve-secret.yml"
+        vars:
+          secret:
+            file: "borgbackup/{{ service_name }}_passphrase"
+            content: "{{ dice.stdout }}"
+
+      - name: PREP | Set the passphrase
+        set_fact:
+          backup_passphrase: "{{ secret_content }}"
+
+    - name: PREP | Create a database backup user
+      block:
+        - name: PREP | Create the user
+          no_log: true
+          community.postgresql.postgresql_user:
+            name: "{{ backup_username }}"
+            password: "{{ lookup('community.general.passwordstore', 'borgbackup/db_password missing=create') }}"
+            comment: "read-only user for borgbackup dumps"
+
+        - name: PREP | Allow the user to read all tables in the database
+          community.postgresql.postgresql_privs:
+            db: "{{ db.name }}"
+            role: "{{ backup_username }}"
+            schema: "{{ db.schema|default('public') }}"
+            objs: ALL_IN_SCHEMA
+            privs: SELECT
+
+        - name: PREP | Allow the user to read all sequences in the database
+          community.postgresql.postgresql_privs:
+            db: "{{ db.name }}"
+            role: "{{ backup_username }}"
+            schema: "{{ db.schema|default('public') }}"
+            type: sequence
+            objs: ALL_IN_SCHEMA
+            privs: SELECT
+
+        - name: PREP | Allow user to CONNECT to database
+          community.postgresql.postgresql_privs:
+            db: "{{ db.name }}"
+            role: "{{ backup_username }}"
+            type: database
+            objs: "{{ db.name }}"
+            privs: CONNECT
+
+        - name: PREP | GRANT USAGE ON SCHEMA TO backup user  # This is required for the user to actually read something
+          community.postgresql.postgresql_privs:
+            db: "{{ db.name }}"
+            role: "{{ backup_username }}"
+            objs: "{{ db.schema|default('public') }}"
+            type: schema
+            privs: USAGE
+
+        - name: PREP | ALTER DEFAULT PRIVILEGES ON DATABASE
+          community.postgresql.postgresql_privs:
+            db: "{{ db.name }}"
+            objs: TABLES
+            privs: "SELECT"
+            type: default_privs
+            role: "{{ backup_username }}"
+            grant_option: yes
+      tags: db_prep
+
+  tasks:
+    - name: NAS_MOUNT | Setup the mount
+      block:
+        - name: NAS_MOUNT | Get the mount name
+          block:
+            - name: NAS_MOUNT | Run systemd-escape to get the mount name
+              changed_when: false
+              command: "systemd-escape -p --suffix=mount '{{ nfs.where }}'"
+              register: _mount_name
+            - name: NAS_MOUNT | Record the service name
+              set_fact:
+                mount_name: "{{ _mount_name.stdout }}"
+        - name: NAS_MOUNT | Place the mount file
+          template:
+            src: "{{ inventory_dir }}/templates/nfs/template.mount.j2"
+            dest: "/etc/systemd/system/{{ mount_name }}"
+        - name: NAS_MOUNT | Create mountpoint
+          file:
+            path: "{{ nfs.where }}"
+            state: directory
+    - name: SYSTEMD | Configure systemd
+      block:
+        - name: SYSTEMD | Place the service file
+          template:
+            src: "{{ inventory_dir }}/templates/borgmatic/borgmatic.service.j2"
+            dest: "/etc/systemd/system/{{ backup_service_name }}"
+        - name: SYSTEMD | Place the timer
+          template:
+            src: "{{ inventory_dir }}/templates/borgmatic/borgmatic.timer.j2"
+            dest: "/etc/systemd/system/{{ backup_timer_name }}"
+        - name: SYSTEMD | Enable the timer
+          systemd:
+            daemon_reload: yes
+            name: "{{ backup_timer_name }}"
+            state: started
+            enabled: true
+      tags: systemd
+    - name: CONFIG | Place borgmatic config
+      no_log: true
+      template:
+        src: "{{ inventory_dir }}/templates/borgmatic/config_template.yaml.j2"
+        dest: "{{ config_name }}"
+        mode: "0600"
+      vars:
+        backup_database:
+          username: "borgbackup"
+          password: "{{ lookup('community.general.passwordstore', 'borgbackup/db_password') }}"
+          name: "{{ db.name }}"
+          hostname: "{{ db.hostname }}"
+      tags: config
+
